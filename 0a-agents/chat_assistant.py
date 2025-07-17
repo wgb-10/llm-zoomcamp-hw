@@ -1,7 +1,7 @@
-import json
-
 from IPython.display import display, HTML
 import markdown
+
+from google.genai import types
 
 
 class Tools:
@@ -10,7 +10,8 @@ class Tools:
         self.functions = {}
 
     def add_tool(self, function, description):
-        self.tools[function.__name__] = description
+        self.tools[function.__name__] = types.Tool(function_declarations=[description])
+
         self.functions[function.__name__] = function
 
     def get_tools(self):
@@ -18,16 +19,15 @@ class Tools:
 
     def function_call(self, tool_call_response):
         function_name = tool_call_response.name
-        arguments = json.loads(tool_call_response.arguments)
+        arguments = tool_call_response.args
 
         f = self.functions[function_name]
         result = f(**arguments)
 
-        return {
-            "type": "function_call_output",
-            "call_id": tool_call_response.call_id,
-            "output": json.dumps(result, indent=2),
-        }
+        return types.Part.from_function_response(
+            name=function_name,
+            response={"result": result},
+        )
 
 
 def shorten(text, max_length=50):
@@ -48,14 +48,14 @@ class ChatInterface:
     def display_function_call(self, entry, result):
         call_html = f"""
             <details>
-            <summary>Function call: <tt>{entry.name}({shorten(entry.arguments)})</tt></summary>
+            <summary>Function call: <tt>{entry.name}({shorten(entry.args)})</tt></summary>
             <div>
                 <b>Call</b>
                 <pre>{entry}</pre>
             </div>
             <div>
                 <b>Output</b>
-                <pre>{result['output']}</pre>
+                <pre>{result.response['result']}</pre>
             </div>
             
             </details>
@@ -63,7 +63,7 @@ class ChatInterface:
         display(HTML(call_html))
 
     def display_response(self, entry):
-        response_html = markdown.markdown(entry.content[0].text)
+        response_html = markdown.markdown(entry.text)
         html = f"""
             <div>
                 <div><b>Assistant:</b></div>
@@ -75,22 +75,28 @@ class ChatInterface:
 
 class ChatAssistant:
     def __init__(self, tools, developer_prompt, chat_interface, client):
-        self.tools = tools
         self.developer_prompt = developer_prompt
+        self.tools = tools
         self.chat_interface = chat_interface
         self.client = client
 
     def gpt(self, chat_messages):
-        return self.client.responses.create(
-            model="gpt-4o-mini",
-            input=chat_messages,
-            tools=self.tools.get_tools(),
+        return self.client.models.generate_content(
+            model="gemini-2.5-flash",
+            contents=chat_messages,
+            config=types.GenerateContentConfig(
+                tools=self.tools.get_tools(),
+                system_instruction=self.developer_prompt,
+                temperature=0,  # setting to 0 (for reliable function calls)
+                thinking_config=types.ThinkingConfig(
+                    thinking_budget=0
+                ),  # Disables thinking
+            ),
         )
 
     def run(self):
-        chat_messages = [
-            {"role": "developer", "content": self.developer_prompt},
-        ]
+
+        chat_messages = []
 
         # Chat loop
         while True:
@@ -99,23 +105,26 @@ class ChatAssistant:
                 self.chat_interface.display("Chat ended.")
                 break
 
-            message = {"role": "user", "content": question}
-            chat_messages.append(message)
+            chat_messages.append(
+                types.Content(role="user", parts=[types.Part(text=question)])
+            )
 
             while True:  # inner request loop
                 response = self.gpt(chat_messages)
 
                 has_messages = False
 
-                for entry in response.output:
+                for entry in response.candidates[0].content.parts:
                     chat_messages.append(entry)
 
-                    if entry.type == "function_call":
-                        result = self.tools.function_call(entry)
-                        chat_messages.append(result)
-                        self.chat_interface.display_function_call(entry, result)
+                    if entry.function_call:
+                        result = self.tools.function_call(entry.function_call)
+                        chat_messages.append(types.Content(role="user", parts=[result]))
+                        self.chat_interface.display_function_call(
+                            entry.function_call, result.function_response
+                        )
 
-                    elif entry.type == "message":
+                    else:
                         self.chat_interface.display_response(entry)
                         has_messages = True
 
